@@ -1,21 +1,32 @@
 # app/main.py
-from bson import ObjectId
-from datetime import datetime, time, date, timedelta
-from typing import List, Optional
 
-import json
-import hashlib
 
 from app.base_model_classes import *
 from app.integrity import compute_data_hash, append_to_ledger, setup_integrity_indexes
 
 from fastapi import FastAPI, HTTPException, Path
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Path, Response
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from .config import settings
 
+
+app = FastAPI(title="Medication Adherence Backend (Minimal)")
+
+origins = [
+    "http://localhost:3000",    # Frontend Next.js padrão
+    "http://127.0.0.1:3000",    # Variação do localhost
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite GET, POST, PUT, DELETE, etc.
+    allow_headers=["*"],  # Permite todos os headers (Authorization, etc.)
+)
 # -------------------------
 # PillIntakeEvaluator + regras
 # -------------------------
@@ -79,7 +90,7 @@ class PillIntakeEvaluator:
 # FastAPI app + Mongo client
 # -------------------------
 
-app = FastAPI(title="Medication Adherence Backend (Minimal)")
+# app = FastAPI(title="Medication Adherence Backend (Minimal)")
 
 mongo_client: AsyncIOMotorClient | None = None
 
@@ -99,6 +110,20 @@ async def startup_event():
     )
     await db.prescriptions.create_index([("patient_id", 1), ("status", 1)])
     await setup_integrity_indexes(db)
+
+    await db.patients.create_index("patient_id", unique=True)
+    await db.patients.create_index("doctor_id")
+
+    await db.medications.create_index("name")
+    await db.medications.create_index("medication_id", unique=True)
+
+    await db.patient_messages.create_index([("patient_id", 1), ("created_at", -1)])
+    await db.patient_messages.create_index([("doctor_id", 1), ("created_at", -1)])
+
+    # Doctors (NOVO)
+    await db.doctors.create_index("name")
+    await db.doctors.create_index("email", unique=False)
+    await db.doctors.create_index("crm", unique=False)
 
 
 @app.on_event("shutdown")
@@ -166,6 +191,44 @@ def map_session_doc(doc: dict) -> SessionOut:
         updated_at=doc.get("updated_at"),
     )
 
+def map_patient_doc(doc: dict) -> PatientOut:
+    return PatientOut(
+        patient_id=str(doc.get("_id")),
+        name=doc.get("name"),
+        date_of_birth=doc.get("date_of_birth"),
+        sex=doc.get("sex"),
+        contact_phone=doc.get("contact_phone"),
+        contact_email=doc.get("contact_email"),
+        doctor_id=doc.get("doctor_id"),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+    )
+
+
+def map_medication_doc(doc: dict) -> MedicationOut:
+    return MedicationOut(
+        medication_id=str(doc.get("_id")),
+        name=doc.get("name"),
+        dosage_form=doc.get("dosage_form"),
+        strength=doc.get("strength"),
+        atc_code=doc.get("atc_code"),
+        notes=doc.get("notes"),
+        created_at=doc.get("created_at"),
+        updated_at=doc.get("updated_at"),
+    )
+
+
+def map_patient_message_doc(doc: dict) -> PatientMessageOut:
+    return PatientMessageOut(
+        message_id=str(doc.get("_id")),
+        patient_id=doc.get("patient_id"),
+        doctor_id=doc.get("doctor_id"),
+        subject=doc.get("subject"),
+        message=doc.get("message"),
+        sender_role=doc.get("sender_role"),
+        status=doc.get("status"),
+        created_at=doc.get("created_at"),
+    )
 
 async def compute_adherence_summary(
     db,
@@ -559,6 +622,15 @@ async def create_or_update_prescription(patient_id: str,payload: PrescriptionIn,
     }
 
 
+@app.options("/api/v1/patients/{patient_id}/prescriptions")
+async def options_prescriptions(patient_id: str):
+    """
+    Endpoint explícito para pré-flight CORS do navegador.
+    O CORSMiddleware vai adicionar os headers CORS, e aqui só devolvemos 200.
+    """
+    return Response(status_code=200)
+
+
 # ENDPOINT LISTAR PRESCRICOES
 
 @app.get(
@@ -572,6 +644,18 @@ async def list_prescriptions_for_patient(patient_id: str):
     docs = await cursor.to_list(length=None)
     return [map_prescription_doc(d) for d in docs]
 
+
+@app.get(
+    "/api/v1/patients/{patient_id}/prescriptions/{prescription_id}",
+    response_model=PrescriptionOut,
+    summary="Get a specific prescription for a patient",
+)
+async def get_prescription_for_patient(patient_id: str, prescription_id: str):
+    db = get_db()
+    doc = await db.prescriptions.find_one({"_id": prescription_id, "patient_id": patient_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Prescription not found")
+    return map_prescription_doc(doc)
 
 #ENDPOINT LIST INTAKE
 
@@ -936,3 +1020,313 @@ def log_intake_event_to_ledger(intake_doc: dict):
     eid = intake_doc.get("_id")
     data_hash = intake_doc.get("data_hash")
     print(f"[LEDGER] IntakeEvent {eid} hash={data_hash}")
+
+
+# -------------------------
+# Patients API
+# -------------------------
+
+@app.post(
+    "/api/v1/patients",
+    response_model=PatientOut,
+    summary="Create or update a patient",
+)
+async def create_or_update_patient(payload: PatientIn):
+    db = get_db()
+    now = datetime.utcnow()
+
+    if payload.patient_id == "":
+        raise HTTPException(status_code=400, detail="patient_id must not be empty")
+
+    # converter date_of_birth -> datetime
+    dob_dt = (
+        datetime.combine(payload.date_of_birth, time.min)
+        if payload.date_of_birth is not None
+        else None
+    )
+
+    base_doc = {
+        "name": payload.name,
+        "date_of_birth": dob_dt,
+        "sex": payload.sex,
+        "contact_phone": payload.contact_phone,
+        "contact_email": payload.contact_email,
+        "doctor_id": payload.doctor_id,
+    }
+
+    doc = {
+        **base_doc,
+        "updated_at": now,
+    }
+
+    await db.patients.update_one(
+        {"_id": payload.patient_id},
+        {
+            "$setOnInsert": {"created_at": now},
+            "$set": doc,
+        },
+        upsert=True,
+    )
+
+    saved = await db.patients.find_one({"_id": payload.patient_id})
+    return map_patient_doc(saved)
+
+
+@app.get(
+    "/api/v1/patients",
+    response_model=List[PatientOut],
+    summary="List patients (optionally filter by doctor_id)",
+)
+async def list_patients(doctor_id: Optional[str] = None, limit: int = 100):
+    db = get_db()
+    query = {}
+    if doctor_id:
+        query["doctor_id"] = doctor_id
+
+    cursor = db.patients.find(query).sort("created_at", 1).limit(limit)
+    docs = await cursor.to_list(length=None)
+    return [map_patient_doc(d) for d in docs]
+
+
+@app.get(
+    "/api/v1/patients/{patient_id}",
+    response_model=PatientOut,
+    summary="Get patient details",
+)
+async def get_patient(patient_id: str):
+    db = get_db()
+    doc = await db.patients.find_one({"_id": patient_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return map_patient_doc(doc)
+
+
+@app.put(
+    "/api/v1/patients/{patient_id}",
+    response_model=PatientOut,
+    summary="Update patient data",
+)
+async def update_patient(patient_id: str, payload: PatientIn):
+    """
+    Mantemos o mesmo modelo PatientIn para PUT; ele deve conter o mesmo patient_id.
+    """
+    if payload.patient_id != patient_id:
+        raise HTTPException(
+            status_code=400,
+            detail="patient_id in path does not match patient_id in body",
+        )
+
+    db = get_db()
+    now = datetime.utcnow()
+
+    dob_dt = (
+        datetime.combine(payload.date_of_birth, time.min)
+        if payload.date_of_birth is not None
+        else None
+    )
+
+    base_doc = {
+        "name": payload.name,
+        "date_of_birth": dob_dt,
+        "sex": payload.sex,
+        "contact_phone": payload.contact_phone,
+        "contact_email": payload.contact_email,
+        "doctor_id": payload.doctor_id,
+    }
+
+    await db.patients.update_one(
+        {"_id": patient_id},
+        {
+            "$set": {
+                **base_doc,
+                "updated_at": now,
+            }
+        },
+        upsert=False,
+    )
+
+    doc = await db.patients.find_one({"_id": patient_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Patient not found after update")
+
+    return map_patient_doc(doc)
+
+
+# -------------------------
+# Medications API
+# -------------------------
+
+@app.post(
+    "/api/v1/medications",
+    response_model=MedicationOut,
+    summary="Create or update a medication",
+)
+async def create_or_update_medication(payload: MedicationIn):
+    db = get_db()
+    now = datetime.utcnow()
+
+    if payload.medication_id == "":
+        raise HTTPException(status_code=400, detail="medication_id must not be empty")
+
+    base_doc = {
+        "name": payload.name,
+        "dosage_form": payload.dosage_form,
+        "strength": payload.strength,
+        "atc_code": payload.atc_code,
+        "notes": payload.notes,
+    }
+
+    doc = {
+        **base_doc,
+        "updated_at": now,
+    }
+
+    await db.medications.update_one(
+        {"_id": payload.medication_id},
+        {
+            "$setOnInsert": {"created_at": now},
+            "$set": doc,
+        },
+        upsert=True,
+    )
+
+    saved = await db.medications.find_one({"_id": payload.medication_id})
+    return map_medication_doc(saved)
+
+
+@app.get(
+    "/api/v1/medications",
+    response_model=List[MedicationOut],
+    summary="List medications",
+)
+async def list_medications(q: Optional[str] = None, limit: int = 100):
+    db = get_db()
+    query = {}
+    if q:
+        # filtro simples por nome (case insensitive)
+        query["name"] = {"$regex": q, "$options": "i"}
+
+    cursor = db.medications.find(query).sort("name", 1).limit(limit)
+    docs = await cursor.to_list(length=None)
+    return [map_medication_doc(d) for d in docs]
+
+
+@app.get(
+    "/api/v1/medications/{medication_id}",
+    response_model=MedicationOut,
+    summary="Get medication details",
+)
+async def get_medication(medication_id: str):
+    db = get_db()
+    doc = await db.medications.find_one({"_id": medication_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Medication not found")
+    return map_medication_doc(doc)
+
+
+# -------------------------
+# Patient Messages API
+# -------------------------
+
+@app.post(
+    "/api/v1/patients/{patient_id}/messages",
+    response_model=PatientMessageOut,
+    summary="Patient sends a message to the doctor",
+)
+async def create_patient_message(
+    patient_id: str,
+    payload: PatientMessageIn,
+):
+    db = get_db()
+    now = datetime.utcnow()
+
+    doc = {
+        "patient_id": patient_id,
+        "doctor_id": payload.doctor_id,
+        "subject": payload.subject,
+        "message": payload.message,
+        "sender_role": "patient",  # por enquanto fixo; depois usamos auth
+        "status": "new",
+        "created_at": now,
+    }
+
+    result = await db.patient_messages.insert_one(doc)
+    saved = await db.patient_messages.find_one({"_id": result.inserted_id})
+    return map_patient_message_doc(saved)
+
+
+@app.get(
+    "/api/v1/patients/{patient_id}/messages",
+    response_model=List[PatientMessageOut],
+    summary="List messages for a patient (doctor view)",
+)
+async def list_patient_messages(
+    patient_id: str,
+    doctor_id: Optional[str] = None,
+    limit: int = 100,
+):
+    db = get_db()
+    query = {"patient_id": patient_id}
+    if doctor_id:
+        query["doctor_id"] = doctor_id
+
+    cursor = (
+        db.patient_messages.find(query)
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    docs = await cursor.to_list(length=None)
+    return [map_patient_message_doc(d) for d in docs]
+
+
+# -------------------------
+# Doctors API
+# -------------------------
+
+@app.post("/api/v1/doctors", response_model=DoctorOut)
+async def create_or_update_doctor(payload: DoctorIn):
+    db = get_db()
+    now = datetime.utcnow()
+
+    doc = {
+        "name": payload.name,
+        "specialty": payload.specialty,
+        "crm": payload.crm,
+        "email": payload.email,
+        "phone": payload.phone,
+        "clinic_name": payload.clinic_name,
+        "notes": payload.notes,
+        "updated_at": now,
+    }
+
+    result = await db.doctors.update_one(
+        {"_id": payload.doctor_id},
+        {
+            "$set": doc,
+            "$setOnInsert": {"created_at": now}
+        },
+        upsert=True
+    )
+
+    saved = await db.doctors.find_one({"_id": payload.doctor_id})
+    saved["doctor_id"] = saved["_id"]
+    return DoctorOut(**saved)
+
+
+@app.get("/api/v1/doctors", response_model=List[DoctorOut])
+async def list_doctors():
+    db = get_db()
+    cursor = db.doctors.find().sort("name", 1)
+    docs = await cursor.to_list(length=None)
+    return [
+        DoctorOut(**{**d, "doctor_id": d["_id"]})
+        for d in docs
+    ]
+
+@app.get("/api/v1/doctors/{doctor_id}", response_model=DoctorOut)
+async def get_doctor(doctor_id: str):
+    db = get_db()
+    doc = await db.doctors.find_one({"_id": doctor_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    return DoctorOut(**{**doc, "doctor_id": doctor_id})

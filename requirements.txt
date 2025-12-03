@@ -2,4 +2,5 @@ fastapi
 uvicorn
 motor
 pydantic
+pydantic-settings
 web3

@@ -112,3 +112,93 @@ class PatientAdherenceSummary(BaseModel):
     window_start: date
     window_end: date
     prescriptions: List[PrescriptionAdherenceSummary]
+
+
+class PatientIn(BaseModel):
+    patient_id: str = Field(..., description="Unique patient identifier (will be used as _id)")
+    name: str = Field(..., description="Full name of the patient")
+    date_of_birth: Optional[date] = Field(None, description="Date of birth")
+    sex: Optional[str] = Field(
+        None, description="Sex of the patient (e.g., 'M', 'F', 'Other')"
+    )
+    contact_phone: Optional[str] = Field(None, description="Contact phone number")
+    contact_email: Optional[str] = Field(None, description="Contact email")
+    doctor_id: Optional[str] = Field(None, description="Responsible doctor identifier")
+
+
+class PatientOut(BaseModel):
+    patient_id: str
+    name: str
+    date_of_birth: Optional[datetime] = None
+    sex: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_email: Optional[str] = None
+    doctor_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class MedicationIn(BaseModel):
+    medication_id: str = Field(..., description="Unique medication identifier (will be used as _id)")
+    name: str = Field(..., description="Medication name (e.g., 'Metformin')")
+    dosage_form: Optional[str] = Field(
+        None, description="Dosage form (e.g., 'tablet', 'capsule')"
+    )
+    strength: Optional[str] = Field(
+        None, description="Strength description (e.g., '500 mg')"
+    )
+    atc_code: Optional[str] = Field(
+        None, description="Optional ATC or catalog code for future integrations"
+    )
+    notes: Optional[str] = Field(None, description="Optional notes about the medication")
+
+
+class MedicationOut(BaseModel):
+    medication_id: str
+    name: str
+    dosage_form: Optional[str] = None
+    strength: Optional[str] = None
+    atc_code: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class PatientMessageIn(BaseModel):
+    subject: str = Field(..., description="Short subject for the message")
+    message: str = Field(..., description="Message body (e.g., adverse reaction description)")
+    doctor_id: Optional[str] = Field(None, description="Target doctor (if applicable)")
+
+
+class PatientMessageOut(BaseModel):
+    message_id: str
+    patient_id: str
+    doctor_id: Optional[str] = None
+    subject: str
+    message: str
+    sender_role: str
+    status: str
+    created_at: datetime
+
+class DoctorIn(BaseModel):
+    doctor_id: str = Field(..., description="Unique doctor ID")
+    name: str
+    specialty: Optional[str] = None
+    crm: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    clinic_name: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class DoctorOut(BaseModel):
+    doctor_id: str
+    name: str
+    specialty: Optional[str]
+    crm: Optional[str]
+    email: Optional[str]
+    phone: Optional[str]
+    clinic_name: Optional[str]
+    notes: Optional[str]
+    created_at: datetime
+    updated_at: datetime
